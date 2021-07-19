@@ -1,0 +1,922 @@
+{
+ "metadata": {
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.10"
+  },
+  "orig_nbformat": 4,
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3.7.10 64-bit ('transformer_chatbot': conda)"
+  },
+  "interpreter": {
+   "hash": "3ec59ffd65a17d02919676ef9ed7c1a9be5574d8252ad1bca031311987c5d24c"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2,
+ "cells": [
+  {
+   "source": [
+    "# Transformer 모델"
+   ],
+   "cell_type": "markdown",
+   "metadata": {}
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import math\n",
+    "import numpy as np\n",
+    "import random\n",
+    "import matplotlib.pyplot as plt\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.nn.functional as F \n",
+    "import torchtext\n",
+    "import torch.optim as optim\n",
+    "import time"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "torch.manual_seed(1234)\n",
+    "np.random.seed(1234)\n",
+    "random.seed(1234)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class PositionalEncoder(nn.Module):\n",
+    "    def __init__(self, position, d_model):\n",
+    "        super().__init__()\n",
+    "\n",
+    "        self.d_model = d_model \n",
+    "        pe = torch.zeros(position, d_model)\n",
+    "\n",
+    "        device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "        pe = pe.to(device)\n",
+    "\n",
+    "        for pos in range(position):\n",
+    "            for i in range(0, d_model, 2):\n",
+    "                pe[pos, i] = math.sin(pos/(10000 ** ((2 * i)/d_model)))\n",
+    "                pe[pos, i + 1] = math.cos(pos/(10000 ** ((2 * i)/d_model)))\n",
+    "\n",
+    "        self.pe = pe.unsqueeze(0)\n",
+    "        self.pe.requires_grad = False\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        ret = math.sqrt(self.d_model)*x + self.pe[:, :x.size(1)]\n",
+    "        return ret"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def scaled_dot_product_attention(query, key, value, mask):\n",
+    "  matmul_qk = torch.matmul(query, torch.transpose(key,2,3))\n",
+    "  depth = key.shape[-1]\n",
+    "  logits = matmul_qk / math.sqrt(depth)\n",
+    "\n",
+    "  if mask is not None:\n",
+    "    logits += (mask * -1e9)\n",
+    "\n",
+    "  attention_weights = F.softmax(logits, dim=-1)\n",
+    "\n",
+    "  output = torch.matmul(attention_weights, value)\n",
+    "\n",
+    "  return output, attention_weights"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class MultiheadAttention(nn.Module):\n",
+    "\n",
+    "    def __init__(self, d_model, num_heads):\n",
+    "        super(MultiheadAttention, self).__init__()\n",
+    "        self.d_model = d_model\n",
+    "        self.num_heads = num_heads\n",
+    "\n",
+    "        assert d_model % self.num_heads == 0\n",
+    "        self.depth = int(d_model/self.num_heads)\n",
+    "\n",
+    "        self.q_linear = nn.Linear(d_model, d_model)\n",
+    "        self.v_linear = nn.Linear(d_model, d_model)\n",
+    "        self.k_linear = nn.Linear(d_model, d_model)\n",
+    "        self.out = nn.Linear(d_model, d_model)\n",
+    "\n",
+    "\n",
+    "    def split_heads(self, inputs, batch_size):\n",
+    "      inputs = torch.reshape(\n",
+    "          inputs, (batch_size, -1, self.num_heads, self.depth))\n",
+    "      return torch.transpose(inputs, 1,2)\n",
+    "\n",
+    "    def forward(self, inputs):\n",
+    "        query, key, value, mask = inputs['query'], inputs['key'], inputs['value'], inputs['mask']\n",
+    "        batch_size = query.shape[0]\n",
+    "        # query : (batch_size, query의 문장 길이, d_model)\n",
+    "        # key : (batch_size, key의 문장 길이, d_model)\n",
+    "        # value : (batch_size, value의 문장 길이, d_model)\n",
+    "        query = self.q_linear(query)\n",
+    "        key = self.k_linear(key)\n",
+    "        value = self.v_linear(value)\n",
+    "\n",
+    "\n",
+    "        # query : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)\n",
+    "        # key : (batch_size, num_heads, key의 문장 길이, d_model/num_heads)\n",
+    "        # value : (batch_size, num_heads, value의 문장 길이, d_model/num_heads)\n",
+    "        query = self.split_heads(query, batch_size)\n",
+    "        key = self.split_heads(key, batch_size)\n",
+    "        value = self.split_heads(value, batch_size)\n",
+    "\n",
+    "        # (batch_size, num_heads, query의 문장 길이, d_model/num_heads)\n",
+    "        scaled_attention, _ = scaled_dot_product_attention(query, key, value, mask)\n",
+    "        # (batch_size, query의 문장 길이, num_heads, d_model/num_heads)\n",
+    "        scaled_attention = torch.transpose(scaled_attention, 1,2)\n",
+    "\n",
+    "        # (batch_size, query의 문장 길이, d_model)\n",
+    "        concat_attention = torch.reshape(scaled_attention,\n",
+    "                                      (batch_size, -1, self.d_model))\n",
+    "\n",
+    "        outputs = self.out(concat_attention)\n",
+    "        return outputs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class FeedForward(nn.Module):\n",
+    "    def __init__(self, d_model, d_ff):\n",
+    "        super(FeedForward, self).__init__()\n",
+    "        self.linear_1 = nn.Linear(d_model, d_ff)\n",
+    "        self.linear_2 = nn.Linear(d_ff, d_model)\n",
+    "\n",
+    "    def forward(self, attention):\n",
+    "        outputs = self.linear_1(attention)\n",
+    "        outputs = F.relu(outputs)\n",
+    "        outputs = self.linear_2(outputs)\n",
+    "        return outputs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class EncoderBlock(nn.Module):\n",
+    "  def __init__(self, d_ff, d_model, num_heads, dropout):\n",
+    "    super(EncoderBlock, self).__init__()\n",
+    "    \n",
+    "    self.attn = MultiheadAttention(d_model, num_heads)\n",
+    "    self.dropout_1 = nn.Dropout(dropout)\n",
+    "    self.norm_1 = nn.LayerNorm(d_model)\n",
+    "    self.ff = FeedForward(d_model, d_ff)\n",
+    "    self.dropout_2 = nn.Dropout(dropout)\n",
+    "    self.norm_2 = nn.LayerNorm(d_model)\n",
+    "\n",
+    "  def forward(self, inputs, padding_mask):\n",
+    "    attention = self.attn({'query': inputs, 'key': inputs, 'value': inputs, 'mask': padding_mask})\n",
+    "    attention = self.dropout_1(attention)\n",
+    "    attention = self.norm_1(inputs + attention)\n",
+    "    outputs = self.ff(attention)\n",
+    "    outputs = self.dropout_2(outputs)\n",
+    "    outputs = self.norm_2(attention + outputs)\n",
+    "\n",
+    "    return outputs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Encoder(nn.Module):\n",
+    "  def __init__(self,text_embedding_vectors, vocab_size, num_layers, d_ff, d_model, num_heads, dropout):\n",
+    "    super(Encoder, self).__init__()\n",
+    "    self.vocab_size = vocab_size\n",
+    "    self.d_model = d_model\n",
+    "    self.num_layers = num_layers\n",
+    "    self.embb = nn.Embedding(text_embedding_vectors, d_model)\n",
+    "    self.dropout_1 = nn.Dropout(dropout)\n",
+    "    self.PE = PositionalEncoder(vocab_size, d_model)\n",
+    "    self.encoder_block = EncoderBlock(d_ff, d_model, num_heads, dropout)\n",
+    "  def forward(self, x, padding_mask):\n",
+    "    emb = self.embb(x)\n",
+    "    emb *= math.sqrt(self.d_model)\n",
+    "    emb = self.PE(emb)\n",
+    "    output = self.dropout_1(emb)\n",
+    "\n",
+    "    for i in range(self.num_layers):\n",
+    "      output = self.encoder_block(output, padding_mask)\n",
+    "\n",
+    "    return output"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class DecoderBlock(nn.Module):\n",
+    "  def __init__(self, d_ff, d_model, num_heads, dropout):\n",
+    "    super(DecoderBlock, self).__init__()\n",
+    "    \n",
+    "    self.attn = MultiheadAttention(d_model, num_heads)\n",
+    "    self.attn_2 = MultiheadAttention(d_model, num_heads)\n",
+    "    self.dropout_1 = nn.Dropout(dropout)\n",
+    "    self.norm_1 = nn.LayerNorm(d_model)\n",
+    "    self.ff = FeedForward(d_model, d_ff)\n",
+    "    self.dropout_2 = nn.Dropout(dropout)\n",
+    "    self.dropout_3 = nn.Dropout(dropout)\n",
+    "    self.norm_2 = nn.LayerNorm(d_model)\n",
+    "    self.norm_3 = nn.LayerNorm(d_model)\n",
+    "\n",
+    "  def forward(self, inputs, enc_outputs, padding_mask, look_ahead_mask):\n",
+    "    attention1 = self.attn({'query': inputs, 'key': inputs, 'value': inputs, 'mask': look_ahead_mask})\n",
+    "    attention1 = self.norm_1(inputs + attention1)\n",
+    "    attention2 = self.attn_2({'query': attention1, 'key': enc_outputs, 'value': enc_outputs, 'mask': padding_mask})\n",
+    "    attention2 = self.dropout_1(attention2)\n",
+    "    attention2 = self.norm_2(attention1 + attention2)\n",
+    "\n",
+    "    outputs = self.ff(attention2)\n",
+    "    outputs = self.dropout_3(outputs)\n",
+    "    outputs = self.norm_3(attention2 + outputs)\n",
+    "\n",
+    "    return outputs  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Decoder(nn.Module):\n",
+    "  def __init__(self,text_embedding_vectors,  vocab_size, num_layers, d_ff, d_model, num_heads, dropout):\n",
+    "    super(Decoder, self).__init__()\n",
+    "    self.vocab_size = vocab_size\n",
+    "    self.d_model = d_model\n",
+    "    self.num_layers = num_layers\n",
+    "    self.embb = nn.Embedding(text_embedding_vectors, d_model)\n",
+    "    self.dropout_1 = nn.Dropout(dropout)\n",
+    "    self.PE = PositionalEncoder(vocab_size, d_model)\n",
+    "    self.decoder_block = DecoderBlock(d_ff, d_model, num_heads, dropout)\n",
+    "  def forward(self, enc_output, dec_input, padding_mask, look_ahead_mask):\n",
+    "    emb = self.embb(dec_input)\n",
+    "    emb *= math.sqrt(self.d_model)\n",
+    "    emb = self.PE(emb)\n",
+    "    output = self.dropout_1(emb)\n",
+    "    for i in range(self.num_layers):\n",
+    "      output = self.decoder_block(output, enc_output, padding_mask, look_ahead_mask)\n",
+    "\n",
+    "    return output"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class transformer(nn.Module):\n",
+    "    def __init__(self, text_embedding_vectors, vocab_size, num_layers, d_ff, d_model, num_heads, dropout):\n",
+    "        self.vocab_size = vocab_size\n",
+    "        super(transformer, self).__init__()\n",
+    "        self.enc_outputs = Encoder(text_embedding_vectors, vocab_size, num_layers, d_ff, d_model, num_heads, dropout)\n",
+    "        self.dec_outputs = Decoder(text_embedding_vectors, vocab_size, num_layers, d_ff, d_model, num_heads, dropout)\n",
+    "        self.output = nn.Linear(d_model, text_embedding_vectors)\n",
+    "        self.softmax = nn.LogSoftmax(dim=-1)\n",
+    "\n",
+    "    def forward(self, input, dec_input):\n",
+    "        enc_input = input\n",
+    "        dec_input = dec_input\n",
+    "        enc_padding_mask = create_padding_mask(enc_input)\n",
+    "        dec_padding_mask = create_padding_mask(enc_input)\n",
+    "        look_ahead_mask = create_look_ahead_mask(dec_input)\n",
+    "    \n",
+    "        enc_output = self.enc_outputs(enc_input, enc_padding_mask)\n",
+    "        dec_output = self.dec_outputs(enc_output, dec_input, dec_padding_mask, look_ahead_mask)\n",
+    "        output = self.output(dec_output)\n",
+    "        return output"
+   ]
+  },
+  {
+   "source": [
+    "# Torchtext를 이용한 전처리"
+   ],
+   "cell_type": "markdown",
+   "metadata": {}
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from torchtext.legacy import data, datasets\n",
+    "from soynlp.tokenizer import LTokenizer\n",
+    "import torch\n",
+    "tokenizer = LTokenizer()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "execute_result",
+     "data": {
+      "text/plain": [
+       "['자연어', '처리', '연구실', '입니다.']"
+      ]
+     },
+     "metadata": {},
+     "execution_count": 13
+    }
+   ],
+   "source": [
+    "tokenizer('자연어 처리 연구실 입니다.')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "VOCAB_SIZE = 40\n",
+    "\n",
+    "Q = data.Field(\n",
+    "    sequential=True,\n",
+    "    use_vocab=True,\n",
+    "    lower=True,\n",
+    "    tokenize=tokenizer,\n",
+    "    batch_first=True,\n",
+    "    init_token=\"<BOS>\",\n",
+    "    eos_token=\"<EOS>\",\n",
+    "    fix_length=VOCAB_SIZE\n",
+    ")\n",
+    "\n",
+    "A = data.Field(\n",
+    "    sequential=True,\n",
+    "    use_vocab=True,\n",
+    "    lower=True,\n",
+    "    tokenize=tokenizer,\n",
+    "    batch_first=True,\n",
+    "    init_token=\"<BOS>\",\n",
+    "    eos_token=\"<EOS>\",\n",
+    "    fix_length=VOCAB_SIZE\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trainset = data.TabularDataset(path='train.csv', format='csv', skip_header=True,fields=[('Q', Q),('A', A)])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "{'Q': ['나도', '조카가', '생겨', '너무', '기뻐'], 'A': ['정말', '좋은', '소식이네요', '축하할', '특별한', '계획이', '있을까요']}\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(vars(trainset[1]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "훈련 샘플의 개수 : 199360\n"
+     ]
+    }
+   ],
+   "source": [
+    "print('훈련 샘플의 개수 : {}'.format(len(trainset)))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "Q.build_vocab(trainset.Q, trainset.A, min_freq = 2) \n",
+    "A.vocab = Q.vocab\n",
+    "PAD_TOKEN, START_TOKEN, END_TOKEN, UNK_TOKEN = Q.vocab.stoi['<pad>'], Q.vocab.stoi['<BOS>'], Q.vocab.stoi['<EOS>'], Q.vocab.stoi['<unk>']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#VOCAB_SIZE = VOCAB_SIZE\n",
+    "text_embedding_vectors = len(Q.vocab)\n",
+    "NUM_LAYERS = 4\n",
+    "D_FF = 512\n",
+    "D_MODEL = 128\n",
+    "NUM_HEADS = 4\n",
+    "DROPOUT = 0.3\n",
+    "BATCH_SIZE=64"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+    "train_iter = data.BucketIterator(\n",
+    "        trainset, batch_size=BATCH_SIZE,\n",
+    "        shuffle=True, repeat=False, sort=False, device = device)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "89312\n"
+     ]
+    },
+    {
+     "output_type": "execute_result",
+     "data": {
+      "text/plain": [
+       "transformer(\n",
+       "  (enc_outputs): Encoder(\n",
+       "    (embb): Embedding(89312, 128)\n",
+       "    (dropout_1): Dropout(p=0.3, inplace=False)\n",
+       "    (PE): PositionalEncoder()\n",
+       "    (encoder_block): EncoderBlock(\n",
+       "      (attn): MultiheadAttention(\n",
+       "        (q_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (v_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (k_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (out): Linear(in_features=128, out_features=128, bias=True)\n",
+       "      )\n",
+       "      (dropout_1): Dropout(p=0.3, inplace=False)\n",
+       "      (norm_1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)\n",
+       "      (ff): FeedForward(\n",
+       "        (linear_1): Linear(in_features=128, out_features=512, bias=True)\n",
+       "        (linear_2): Linear(in_features=512, out_features=128, bias=True)\n",
+       "      )\n",
+       "      (dropout_2): Dropout(p=0.3, inplace=False)\n",
+       "      (norm_2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)\n",
+       "    )\n",
+       "  )\n",
+       "  (dec_outputs): Decoder(\n",
+       "    (embb): Embedding(89312, 128)\n",
+       "    (dropout_1): Dropout(p=0.3, inplace=False)\n",
+       "    (PE): PositionalEncoder()\n",
+       "    (decoder_block): DecoderBlock(\n",
+       "      (attn): MultiheadAttention(\n",
+       "        (q_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (v_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (k_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (out): Linear(in_features=128, out_features=128, bias=True)\n",
+       "      )\n",
+       "      (attn_2): MultiheadAttention(\n",
+       "        (q_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (v_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (k_linear): Linear(in_features=128, out_features=128, bias=True)\n",
+       "        (out): Linear(in_features=128, out_features=128, bias=True)\n",
+       "      )\n",
+       "      (dropout_1): Dropout(p=0.3, inplace=False)\n",
+       "      (norm_1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)\n",
+       "      (ff): FeedForward(\n",
+       "        (linear_1): Linear(in_features=128, out_features=512, bias=True)\n",
+       "        (linear_2): Linear(in_features=512, out_features=128, bias=True)\n",
+       "      )\n",
+       "      (dropout_2): Dropout(p=0.3, inplace=False)\n",
+       "      (dropout_3): Dropout(p=0.3, inplace=False)\n",
+       "      (norm_2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)\n",
+       "      (norm_3): LayerNorm((128,), eps=1e-05, elementwise_affine=True)\n",
+       "    )\n",
+       "  )\n",
+       "  (output): Linear(in_features=128, out_features=89312, bias=True)\n",
+       "  (softmax): LogSoftmax(dim=-1)\n",
+       ")"
+      ]
+     },
+     "metadata": {},
+     "execution_count": 21
+    }
+   ],
+   "source": [
+    "# model\n",
+    "print(text_embedding_vectors)\n",
+    "net = transformer(text_embedding_vectors = text_embedding_vectors, \n",
+    "                  vocab_size=VOCAB_SIZE, num_layers=NUM_LAYERS, d_ff=D_FF, d_model=D_MODEL, \n",
+    "                  num_heads=NUM_HEADS, dropout=DROPOUT)\n",
+    "\n",
+    "# init network\n",
+    "def weights_init(m):\n",
+    "    classname = m.__class__.__name__\n",
+    "    if classname.find('Linear') != -1:\n",
+    "        # init linear\n",
+    "        nn.init.kaiming_normal_(m.weight)\n",
+    "        if m.bias is not None:\n",
+    "            nn.init.constant_(m.bias, 0.0)\n",
+    "\n",
+    "net.train()\n",
+    "\n",
+    "net.apply(weights_init)\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# loss function\n",
+    "criterion = nn.CrossEntropyLoss()\n",
+    "\n",
+    "learning_rate = 2e-4\n",
+    "optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def create_padding_mask(x):\n",
+    "  input_pad = 0\n",
+    "  mask = (x == input_pad).float()\n",
+    "  mask = mask.unsqueeze(1).unsqueeze(1)\n",
+    "  # (batch_size, 1, 1, key sentence length)\n",
+    "  return mask"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def create_look_ahead_mask(x):\n",
+    "  device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "  seq_len = x.shape[1]\n",
+    "  look_ahead_mask = torch.ones(seq_len, seq_len)\n",
+    "  look_ahead_mask = torch.triu(look_ahead_mask, diagonal=1).to(device)\n",
+    "\n",
+    "  padding_mask = create_padding_mask(x).to(device) \n",
+    "  return torch.maximum(look_ahead_mask, padding_mask)"
+   ]
+  },
+  {
+   "source": [
+    "# 훈련"
+   ],
+   "cell_type": "markdown",
+   "metadata": {}
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from IPython.display import clear_output\n",
+    "import datetime\n",
+    "from tqdm import tqdm \n",
+    "import os\n",
+    "\n",
+    "def train_model(net, train_iter, criterion, optimizer, num_epochs):\n",
+    "    start_time = time.time()\n",
+    "\n",
+    "    ntokens = len(Q.vocab.stoi)\n",
+    "    device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "    print(\"사용 디바이스:\", device)\n",
+    "    print('-----start-------')\n",
+    "    net.to(device)\n",
+    "    epoch_ = []\n",
+    "    epoch_train_loss = []\n",
+    "    torch.backends.cudnn.benchmark = True\n",
+    "    \n",
+    "    net.train()\n",
+    "    best_epoch_loss = float(\"inf\")\n",
+    "    for epoch in range(num_epochs):\n",
+    "      epoch_loss = 0.0\n",
+    "      cnt= 0\n",
+    "      for batch in tqdm(train_iter):\n",
+    "          questions = batch.Q.to(device)\n",
+    "          answers = batch.A.to(device)\n",
+    "          with torch.set_grad_enabled(True):\n",
+    "            preds = net(questions, answers)\n",
+    "            pad = torch.LongTensor(answers.size(0), 1).fill_(PAD_TOKEN).to(device)\n",
+    "            preds_id = torch.transpose(preds,1,2)\n",
+    "            outputs = torch.cat((answers[:, 1:], pad), -1)\n",
+    "            optimizer.zero_grad()\n",
+    "            loss = criterion(preds_id, outputs) \n",
+    "            loss.backward()\n",
+    "            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)\n",
+    "            optimizer.step()\n",
+    "            epoch_loss +=loss.item()\n",
+    "            cnt += 1\n",
+    "      epoch_loss = epoch_loss / cnt\n",
+    "      if not best_epoch_loss or epoch_loss < best_epoch_loss:\n",
+    "        if not os.path.isdir(\"snapshot\"):\n",
+    "            os.makedirs(\"snapshot\")\n",
+    "        torch.save(net.state_dict(), './snapshot/transformermodel.pt')\n",
+    "        \n",
+    "      epoch_.append(epoch)\n",
+    "      epoch_train_loss.append(epoch_loss)\n",
+    "      \n",
+    "      print(\"Epoch {0}/{1} Average Loss: {2}\".format(epoch+1, num_epochs, epoch_loss))\n",
+    "      \n",
+    "    \n",
+    "    \n",
+    "    fig = plt.figure(figsize=(8,8))\n",
+    "    fig.set_facecolor('white')\n",
+    "    ax = fig.add_subplot()\n",
+    "\n",
+    "    ax.plot(epoch_,epoch_train_loss, label='Average loss')\n",
+    "\n",
+    "\n",
+    "    ax.legend()\n",
+    "    ax.set_xlabel('epoch')\n",
+    "    ax.set_ylabel('loss')\n",
+    "\n",
+    "    plt.show()\n",
+    "    end_time = time.time() - start_time\n",
+    "    times = str(datetime.timedelta(seconds=end_time)).split(\".\")\n",
+    "    print('Finished in {0}'.format(times[0]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "사용 디바이스: cuda\n",
+      "-----start-------\n",
+      "100%|██████████| 3115/3115 [04:37<00:00, 11.23it/s]\n",
+      "Epoch 1/30 Average Loss: 1.4127953381637892\n",
+      "100%|██████████| 3115/3115 [04:37<00:00, 11.23it/s]\n",
+      "Epoch 2/30 Average Loss: 1.2708653128548955\n",
+      "100%|██████████| 3115/3115 [04:36<00:00, 11.26it/s]\n",
+      "Epoch 3/30 Average Loss: 1.2245787332375588\n",
+      "100%|██████████| 3115/3115 [04:37<00:00, 11.21it/s]\n",
+      "Epoch 4/30 Average Loss: 1.1860831033743404\n",
+      "100%|██████████| 3115/3115 [04:39<00:00, 11.14it/s]\n",
+      "Epoch 5/30 Average Loss: 1.1547904890383418\n",
+      "100%|██████████| 3115/3115 [04:36<00:00, 11.25it/s]\n",
+      "Epoch 6/30 Average Loss: 1.1292347012323898\n",
+      "100%|██████████| 3115/3115 [04:34<00:00, 11.36it/s]\n",
+      "Epoch 7/30 Average Loss: 1.1072355416383637\n",
+      "100%|██████████| 3115/3115 [04:34<00:00, 11.34it/s]\n",
+      "Epoch 8/30 Average Loss: 1.0873444848803036\n",
+      "100%|██████████| 3115/3115 [04:34<00:00, 11.35it/s]\n",
+      "Epoch 9/30 Average Loss: 1.0693333780976015\n",
+      "100%|██████████| 3115/3115 [04:33<00:00, 11.40it/s]\n",
+      "Epoch 10/30 Average Loss: 1.0526002901323726\n",
+      "100%|██████████| 3115/3115 [04:38<00:00, 11.18it/s]\n",
+      "Epoch 11/30 Average Loss: 1.0374474112715806\n",
+      "100%|██████████| 3115/3115 [04:39<00:00, 11.13it/s]\n",
+      "Epoch 12/30 Average Loss: 1.0235213907916894\n",
+      "100%|██████████| 3115/3115 [05:03<00:00, 10.26it/s]\n",
+      "Epoch 13/30 Average Loss: 1.010978990573179\n",
+      "100%|██████████| 3115/3115 [04:49<00:00, 10.75it/s]\n",
+      "Epoch 14/30 Average Loss: 0.9990389013175597\n",
+      "100%|██████████| 3115/3115 [04:34<00:00, 11.34it/s]\n",
+      "Epoch 15/30 Average Loss: 0.9882845757286965\n",
+      "100%|██████████| 3115/3115 [04:59<00:00, 10.40it/s]\n",
+      "Epoch 16/30 Average Loss: 0.9779701576186987\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.44it/s]\n",
+      "Epoch 17/30 Average Loss: 0.968473253797375\n",
+      "100%|██████████| 3115/3115 [05:02<00:00, 10.31it/s]\n",
+      "Epoch 18/30 Average Loss: 0.959099729313705\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.43it/s]\n",
+      "Epoch 19/30 Average Loss: 0.9501807937269992\n",
+      "100%|██████████| 3115/3115 [05:02<00:00, 10.31it/s]\n",
+      "Epoch 20/30 Average Loss: 0.941922816055353\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.43it/s]\n",
+      "Epoch 21/30 Average Loss: 0.933944637243476\n",
+      "100%|██████████| 3115/3115 [04:59<00:00, 10.41it/s]\n",
+      "Epoch 22/30 Average Loss: 0.9261740446856087\n",
+      "100%|██████████| 3115/3115 [05:00<00:00, 10.36it/s]\n",
+      "Epoch 23/30 Average Loss: 0.9188512514720568\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.43it/s]\n",
+      "Epoch 24/30 Average Loss: 0.9117723130299613\n",
+      "100%|██████████| 3115/3115 [05:01<00:00, 10.32it/s]\n",
+      "Epoch 25/30 Average Loss: 0.9050396803676795\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.44it/s]\n",
+      "Epoch 26/30 Average Loss: 0.8983953578131539\n",
+      "100%|██████████| 3115/3115 [05:01<00:00, 10.35it/s]\n",
+      "Epoch 27/30 Average Loss: 0.8916039136592687\n",
+      "100%|██████████| 3115/3115 [04:59<00:00, 10.40it/s]\n",
+      "Epoch 28/30 Average Loss: 0.8849250529589278\n",
+      "100%|██████████| 3115/3115 [04:58<00:00, 10.43it/s]\n",
+      "Epoch 29/30 Average Loss: 0.8787448204156867\n",
+      "100%|██████████| 3115/3115 [05:01<00:00, 10.32it/s]\n",
+      "Epoch 30/30 Average Loss: 0.8724594941682647\n"
+     ]
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/plain": "<Figure size 576x576 with 1 Axes>",
+      "image/svg+xml": "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"no\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg height=\"479.63625pt\" version=\"1.1\" viewBox=\"0 0 497.446571 479.63625\" width=\"497.446571pt\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n <metadata>\n  <rdf:RDF xmlns:cc=\"http://creativecommons.org/ns#\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n   <cc:Work>\n    <dc:type rdf:resource=\"http://purl.org/dc/dcmitype/StillImage\"/>\n    <dc:date>2021-07-15T17:48:52.249866</dc:date>\n    <dc:format>image/svg+xml</dc:format>\n    <dc:creator>\n     <cc:Agent>\n      <dc:title>Matplotlib v3.4.2, https://matplotlib.org/</dc:title>\n     </cc:Agent>\n    </dc:creator>\n   </cc:Work>\n  </rdf:RDF>\n </metadata>\n <defs>\n  <style type=\"text/css\">*{stroke-linecap:butt;stroke-linejoin:round;}</style>\n </defs>\n <g id=\"figure_1\">\n  <g id=\"patch_1\">\n   <path d=\"M 0 479.63625 \nL 497.446571 479.63625 \nL 497.446571 0 \nL 0 0 \nz\n\" style=\"fill:#ffffff;\"/>\n  </g>\n  <g id=\"axes_1\">\n   <g id=\"patch_2\">\n    <path d=\"M 43.78125 442.08 \nL 490.18125 442.08 \nL 490.18125 7.2 \nL 43.78125 7.2 \nz\n\" style=\"fill:#ffffff;\"/>\n   </g>\n   <g id=\"matplotlib.axis_1\">\n    <g id=\"xtick_1\">\n     <g id=\"line2d_1\">\n      <defs>\n       <path d=\"M 0 0 \nL 0 3.5 \n\" id=\"ma73d6e0713\" style=\"stroke:#000000;stroke-width:0.8;\"/>\n      </defs>\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"64.072159\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_1\">\n      <!-- 0 -->\n      <g transform=\"translate(60.890909 456.678437)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 2034 4250 \nQ 1547 4250 1301 3770 \nQ 1056 3291 1056 2328 \nQ 1056 1369 1301 889 \nQ 1547 409 2034 409 \nQ 2525 409 2770 889 \nQ 3016 1369 3016 2328 \nQ 3016 3291 2770 3770 \nQ 2525 4250 2034 4250 \nz\nM 2034 4750 \nQ 2819 4750 3233 4129 \nQ 3647 3509 3647 2328 \nQ 3647 1150 3233 529 \nQ 2819 -91 2034 -91 \nQ 1250 -91 836 529 \nQ 422 1150 422 2328 \nQ 422 3509 836 4129 \nQ 1250 4750 2034 4750 \nz\n\" id=\"DejaVuSans-30\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-30\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_2\">\n     <g id=\"line2d_2\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"134.040811\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_2\">\n      <!-- 5 -->\n      <g transform=\"translate(130.859561 456.678437)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 691 4666 \nL 3169 4666 \nL 3169 4134 \nL 1269 4134 \nL 1269 2991 \nQ 1406 3038 1543 3061 \nQ 1681 3084 1819 3084 \nQ 2600 3084 3056 2656 \nQ 3513 2228 3513 1497 \nQ 3513 744 3044 326 \nQ 2575 -91 1722 -91 \nQ 1428 -91 1123 -41 \nQ 819 9 494 109 \nL 494 744 \nQ 775 591 1075 516 \nQ 1375 441 1709 441 \nQ 2250 441 2565 725 \nQ 2881 1009 2881 1497 \nQ 2881 1984 2565 2268 \nQ 2250 2553 1709 2553 \nQ 1456 2553 1204 2497 \nQ 953 2441 691 2322 \nL 691 4666 \nz\n\" id=\"DejaVuSans-35\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-35\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_3\">\n     <g id=\"line2d_3\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"204.009463\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_3\">\n      <!-- 10 -->\n      <g transform=\"translate(197.646963 456.678437)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 794 531 \nL 1825 531 \nL 1825 4091 \nL 703 3866 \nL 703 4441 \nL 1819 4666 \nL 2450 4666 \nL 2450 531 \nL 3481 531 \nL 3481 0 \nL 794 0 \nL 794 531 \nz\n\" id=\"DejaVuSans-31\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-30\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_4\">\n     <g id=\"line2d_4\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"273.978115\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_4\">\n      <!-- 15 -->\n      <g transform=\"translate(267.615615 456.678437)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-35\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_5\">\n     <g id=\"line2d_5\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"343.946767\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_5\">\n      <!-- 20 -->\n      <g transform=\"translate(337.584267 456.678437)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 1228 531 \nL 3431 531 \nL 3431 0 \nL 469 0 \nL 469 531 \nQ 828 903 1448 1529 \nQ 2069 2156 2228 2338 \nQ 2531 2678 2651 2914 \nQ 2772 3150 2772 3378 \nQ 2772 3750 2511 3984 \nQ 2250 4219 1831 4219 \nQ 1534 4219 1204 4116 \nQ 875 4013 500 3803 \nL 500 4441 \nQ 881 4594 1212 4672 \nQ 1544 4750 1819 4750 \nQ 2544 4750 2975 4387 \nQ 3406 4025 3406 3419 \nQ 3406 3131 3298 2873 \nQ 3191 2616 2906 2266 \nQ 2828 2175 2409 1742 \nQ 1991 1309 1228 531 \nz\n\" id=\"DejaVuSans-32\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-32\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-30\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_6\">\n     <g id=\"line2d_6\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"413.915419\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_6\">\n      <!-- 25 -->\n      <g transform=\"translate(407.552919 456.678437)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-32\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-35\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"xtick_7\">\n     <g id=\"line2d_7\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"483.884071\" xlink:href=\"#ma73d6e0713\" y=\"442.08\"/>\n      </g>\n     </g>\n     <g id=\"text_7\">\n      <!-- 30 -->\n      <g transform=\"translate(477.521571 456.678437)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 2597 2516 \nQ 3050 2419 3304 2112 \nQ 3559 1806 3559 1356 \nQ 3559 666 3084 287 \nQ 2609 -91 1734 -91 \nQ 1441 -91 1130 -33 \nQ 819 25 488 141 \nL 488 750 \nQ 750 597 1062 519 \nQ 1375 441 1716 441 \nQ 2309 441 2620 675 \nQ 2931 909 2931 1356 \nQ 2931 1769 2642 2001 \nQ 2353 2234 1838 2234 \nL 1294 2234 \nL 1294 2753 \nL 1863 2753 \nQ 2328 2753 2575 2939 \nQ 2822 3125 2822 3475 \nQ 2822 3834 2567 4026 \nQ 2313 4219 1838 4219 \nQ 1578 4219 1281 4162 \nQ 984 4106 628 3988 \nL 628 4550 \nQ 988 4650 1302 4700 \nQ 1616 4750 1894 4750 \nQ 2613 4750 3031 4423 \nQ 3450 4097 3450 3541 \nQ 3450 3153 3228 2886 \nQ 3006 2619 2597 2516 \nz\n\" id=\"DejaVuSans-33\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-33\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-30\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"text_8\">\n     <!-- epoch -->\n     <g transform=\"translate(251.753125 470.356562)scale(0.1 -0.1)\">\n      <defs>\n       <path d=\"M 3597 1894 \nL 3597 1613 \nL 953 1613 \nQ 991 1019 1311 708 \nQ 1631 397 2203 397 \nQ 2534 397 2845 478 \nQ 3156 559 3463 722 \nL 3463 178 \nQ 3153 47 2828 -22 \nQ 2503 -91 2169 -91 \nQ 1331 -91 842 396 \nQ 353 884 353 1716 \nQ 353 2575 817 3079 \nQ 1281 3584 2069 3584 \nQ 2775 3584 3186 3129 \nQ 3597 2675 3597 1894 \nz\nM 3022 2063 \nQ 3016 2534 2758 2815 \nQ 2500 3097 2075 3097 \nQ 1594 3097 1305 2825 \nQ 1016 2553 972 2059 \nL 3022 2063 \nz\n\" id=\"DejaVuSans-65\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 1159 525 \nL 1159 -1331 \nL 581 -1331 \nL 581 3500 \nL 1159 3500 \nL 1159 2969 \nQ 1341 3281 1617 3432 \nQ 1894 3584 2278 3584 \nQ 2916 3584 3314 3078 \nQ 3713 2572 3713 1747 \nQ 3713 922 3314 415 \nQ 2916 -91 2278 -91 \nQ 1894 -91 1617 61 \nQ 1341 213 1159 525 \nz\nM 3116 1747 \nQ 3116 2381 2855 2742 \nQ 2594 3103 2138 3103 \nQ 1681 3103 1420 2742 \nQ 1159 2381 1159 1747 \nQ 1159 1113 1420 752 \nQ 1681 391 2138 391 \nQ 2594 391 2855 752 \nQ 3116 1113 3116 1747 \nz\n\" id=\"DejaVuSans-70\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 1959 3097 \nQ 1497 3097 1228 2736 \nQ 959 2375 959 1747 \nQ 959 1119 1226 758 \nQ 1494 397 1959 397 \nQ 2419 397 2687 759 \nQ 2956 1122 2956 1747 \nQ 2956 2369 2687 2733 \nQ 2419 3097 1959 3097 \nz\nM 1959 3584 \nQ 2709 3584 3137 3096 \nQ 3566 2609 3566 1747 \nQ 3566 888 3137 398 \nQ 2709 -91 1959 -91 \nQ 1206 -91 779 398 \nQ 353 888 353 1747 \nQ 353 2609 779 3096 \nQ 1206 3584 1959 3584 \nz\n\" id=\"DejaVuSans-6f\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 3122 3366 \nL 3122 2828 \nQ 2878 2963 2633 3030 \nQ 2388 3097 2138 3097 \nQ 1578 3097 1268 2742 \nQ 959 2388 959 1747 \nQ 959 1106 1268 751 \nQ 1578 397 2138 397 \nQ 2388 397 2633 464 \nQ 2878 531 3122 666 \nL 3122 134 \nQ 2881 22 2623 -34 \nQ 2366 -91 2075 -91 \nQ 1284 -91 818 406 \nQ 353 903 353 1747 \nQ 353 2603 823 3093 \nQ 1294 3584 2113 3584 \nQ 2378 3584 2631 3529 \nQ 2884 3475 3122 3366 \nz\n\" id=\"DejaVuSans-63\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 3513 2113 \nL 3513 0 \nL 2938 0 \nL 2938 2094 \nQ 2938 2591 2744 2837 \nQ 2550 3084 2163 3084 \nQ 1697 3084 1428 2787 \nQ 1159 2491 1159 1978 \nL 1159 0 \nL 581 0 \nL 581 4863 \nL 1159 4863 \nL 1159 2956 \nQ 1366 3272 1645 3428 \nQ 1925 3584 2291 3584 \nQ 2894 3584 3203 3211 \nQ 3513 2838 3513 2113 \nz\n\" id=\"DejaVuSans-68\" transform=\"scale(0.015625)\"/>\n      </defs>\n      <use xlink:href=\"#DejaVuSans-65\"/>\n      <use x=\"61.523438\" xlink:href=\"#DejaVuSans-70\"/>\n      <use x=\"125\" xlink:href=\"#DejaVuSans-6f\"/>\n      <use x=\"186.181641\" xlink:href=\"#DejaVuSans-63\"/>\n      <use x=\"241.162109\" xlink:href=\"#DejaVuSans-68\"/>\n     </g>\n    </g>\n   </g>\n   <g id=\"matplotlib.axis_2\">\n    <g id=\"ytick_1\">\n     <g id=\"line2d_8\">\n      <defs>\n       <path d=\"M 0 0 \nL -3.5 0 \n\" id=\"m4e6f8b0d6f\" style=\"stroke:#000000;stroke-width:0.8;\"/>\n      </defs>\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"402.162271\"/>\n      </g>\n     </g>\n     <g id=\"text_9\">\n      <!-- 0.9 -->\n      <g transform=\"translate(20.878125 405.96149)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 684 794 \nL 1344 794 \nL 1344 0 \nL 684 0 \nL 684 794 \nz\n\" id=\"DejaVuSans-2e\" transform=\"scale(0.015625)\"/>\n        <path d=\"M 703 97 \nL 703 672 \nQ 941 559 1184 500 \nQ 1428 441 1663 441 \nQ 2288 441 2617 861 \nQ 2947 1281 2994 2138 \nQ 2813 1869 2534 1725 \nQ 2256 1581 1919 1581 \nQ 1219 1581 811 2004 \nQ 403 2428 403 3163 \nQ 403 3881 828 4315 \nQ 1253 4750 1959 4750 \nQ 2769 4750 3195 4129 \nQ 3622 3509 3622 2328 \nQ 3622 1225 3098 567 \nQ 2575 -91 1691 -91 \nQ 1453 -91 1209 -44 \nQ 966 3 703 97 \nz\nM 1959 2075 \nQ 2384 2075 2632 2365 \nQ 2881 2656 2881 3163 \nQ 2881 3666 2632 3958 \nQ 2384 4250 1959 4250 \nQ 1534 4250 1286 3958 \nQ 1038 3666 1038 3163 \nQ 1038 2656 1286 2365 \nQ 1534 2075 1959 2075 \nz\n\" id=\"DejaVuSans-39\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-30\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-39\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"ytick_2\">\n     <g id=\"line2d_9\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"328.995655\"/>\n      </g>\n     </g>\n     <g id=\"text_10\">\n      <!-- 1.0 -->\n      <g transform=\"translate(20.878125 332.794873)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-30\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"ytick_3\">\n     <g id=\"line2d_10\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"255.829038\"/>\n      </g>\n     </g>\n     <g id=\"text_11\">\n      <!-- 1.1 -->\n      <g transform=\"translate(20.878125 259.628257)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-31\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"ytick_4\">\n     <g id=\"line2d_11\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"182.662422\"/>\n      </g>\n     </g>\n     <g id=\"text_12\">\n      <!-- 1.2 -->\n      <g transform=\"translate(20.878125 186.46164)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-32\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"ytick_5\">\n     <g id=\"line2d_12\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"109.495805\"/>\n      </g>\n     </g>\n     <g id=\"text_13\">\n      <!-- 1.3 -->\n      <g transform=\"translate(20.878125 113.295024)scale(0.1 -0.1)\">\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-33\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"ytick_6\">\n     <g id=\"line2d_13\">\n      <g>\n       <use style=\"stroke:#000000;stroke-width:0.8;\" x=\"43.78125\" xlink:href=\"#m4e6f8b0d6f\" y=\"36.329189\"/>\n      </g>\n     </g>\n     <g id=\"text_14\">\n      <!-- 1.4 -->\n      <g transform=\"translate(20.878125 40.128407)scale(0.1 -0.1)\">\n       <defs>\n        <path d=\"M 2419 4116 \nL 825 1625 \nL 2419 1625 \nL 2419 4116 \nz\nM 2253 4666 \nL 3047 4666 \nL 3047 1625 \nL 3713 1625 \nL 3713 1100 \nL 3047 1100 \nL 3047 0 \nL 2419 0 \nL 2419 1100 \nL 313 1100 \nL 313 1709 \nL 2253 4666 \nz\n\" id=\"DejaVuSans-34\" transform=\"scale(0.015625)\"/>\n       </defs>\n       <use xlink:href=\"#DejaVuSans-31\"/>\n       <use x=\"63.623047\" xlink:href=\"#DejaVuSans-2e\"/>\n       <use x=\"95.410156\" xlink:href=\"#DejaVuSans-34\"/>\n      </g>\n     </g>\n    </g>\n    <g id=\"text_15\">\n     <!-- loss -->\n     <g transform=\"translate(14.798438 234.297812)rotate(-90)scale(0.1 -0.1)\">\n      <defs>\n       <path d=\"M 603 4863 \nL 1178 4863 \nL 1178 0 \nL 603 0 \nL 603 4863 \nz\n\" id=\"DejaVuSans-6c\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 2834 3397 \nL 2834 2853 \nQ 2591 2978 2328 3040 \nQ 2066 3103 1784 3103 \nQ 1356 3103 1142 2972 \nQ 928 2841 928 2578 \nQ 928 2378 1081 2264 \nQ 1234 2150 1697 2047 \nL 1894 2003 \nQ 2506 1872 2764 1633 \nQ 3022 1394 3022 966 \nQ 3022 478 2636 193 \nQ 2250 -91 1575 -91 \nQ 1294 -91 989 -36 \nQ 684 19 347 128 \nL 347 722 \nQ 666 556 975 473 \nQ 1284 391 1588 391 \nQ 1994 391 2212 530 \nQ 2431 669 2431 922 \nQ 2431 1156 2273 1281 \nQ 2116 1406 1581 1522 \nL 1381 1569 \nQ 847 1681 609 1914 \nQ 372 2147 372 2553 \nQ 372 3047 722 3315 \nQ 1072 3584 1716 3584 \nQ 2034 3584 2315 3537 \nQ 2597 3491 2834 3397 \nz\n\" id=\"DejaVuSans-73\" transform=\"scale(0.015625)\"/>\n      </defs>\n      <use xlink:href=\"#DejaVuSans-6c\"/>\n      <use x=\"27.783203\" xlink:href=\"#DejaVuSans-6f\"/>\n      <use x=\"88.964844\" xlink:href=\"#DejaVuSans-73\"/>\n      <use x=\"141.064453\" xlink:href=\"#DejaVuSans-73\"/>\n     </g>\n    </g>\n   </g>\n   <g id=\"line2d_14\">\n    <path clip-path=\"url(#p781276b0eb)\" d=\"M 64.072159 26.967273 \nL 78.065889 130.81267 \nL 92.05962 164.678994 \nL 106.05335 192.844944 \nL 120.047081 215.740691 \nL 134.040811 234.438996 \nL 148.034542 250.535037 \nL 162.028272 265.08865 \nL 176.022002 278.266768 \nL 190.015733 290.509802 \nL 204.009463 301.596651 \nL 218.003194 311.785849 \nL 231.996924 320.962699 \nL 245.990654 329.698858 \nL 259.984385 337.567434 \nL 273.978115 345.114145 \nL 287.971846 352.062708 \nL 301.965576 358.920999 \nL 315.959306 365.446682 \nL 329.953037 371.488765 \nL 343.946767 377.326128 \nL 357.940498 383.011608 \nL 371.934228 388.369448 \nL 385.927958 393.548868 \nL 399.921689 398.474907 \nL 413.915419 403.336333 \nL 427.90915 408.305403 \nL 441.90288 413.1921 \nL 455.896611 417.713967 \nL 469.890341 422.312727 \n\" style=\"fill:none;stroke:#1f77b4;stroke-linecap:square;stroke-width:1.5;\"/>\n   </g>\n   <g id=\"patch_3\">\n    <path d=\"M 43.78125 442.08 \nL 43.78125 7.2 \n\" style=\"fill:none;stroke:#000000;stroke-linecap:square;stroke-linejoin:miter;stroke-width:0.8;\"/>\n   </g>\n   <g id=\"patch_4\">\n    <path d=\"M 490.18125 442.08 \nL 490.18125 7.2 \n\" style=\"fill:none;stroke:#000000;stroke-linecap:square;stroke-linejoin:miter;stroke-width:0.8;\"/>\n   </g>\n   <g id=\"patch_5\">\n    <path d=\"M 43.78125 442.08 \nL 490.18125 442.08 \n\" style=\"fill:none;stroke:#000000;stroke-linecap:square;stroke-linejoin:miter;stroke-width:0.8;\"/>\n   </g>\n   <g id=\"patch_6\">\n    <path d=\"M 43.78125 7.2 \nL 490.18125 7.2 \n\" style=\"fill:none;stroke:#000000;stroke-linecap:square;stroke-linejoin:miter;stroke-width:0.8;\"/>\n   </g>\n   <g id=\"legend_1\">\n    <g id=\"patch_7\">\n     <path d=\"M 387.621875 29.878125 \nL 483.18125 29.878125 \nQ 485.18125 29.878125 485.18125 27.878125 \nL 485.18125 14.2 \nQ 485.18125 12.2 483.18125 12.2 \nL 387.621875 12.2 \nQ 385.621875 12.2 385.621875 14.2 \nL 385.621875 27.878125 \nQ 385.621875 29.878125 387.621875 29.878125 \nz\n\" style=\"fill:#ffffff;opacity:0.8;stroke:#cccccc;stroke-linejoin:miter;\"/>\n    </g>\n    <g id=\"line2d_15\">\n     <path d=\"M 389.621875 20.298437 \nL 409.621875 20.298437 \n\" style=\"fill:none;stroke:#1f77b4;stroke-linecap:square;stroke-width:1.5;\"/>\n    </g>\n    <g id=\"line2d_16\"/>\n    <g id=\"text_16\">\n     <!-- Average loss -->\n     <g transform=\"translate(417.621875 23.798437)scale(0.1 -0.1)\">\n      <defs>\n       <path d=\"M 2188 4044 \nL 1331 1722 \nL 3047 1722 \nL 2188 4044 \nz\nM 1831 4666 \nL 2547 4666 \nL 4325 0 \nL 3669 0 \nL 3244 1197 \nL 1141 1197 \nL 716 0 \nL 50 0 \nL 1831 4666 \nz\n\" id=\"DejaVuSans-41\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 191 3500 \nL 800 3500 \nL 1894 563 \nL 2988 3500 \nL 3597 3500 \nL 2284 0 \nL 1503 0 \nL 191 3500 \nz\n\" id=\"DejaVuSans-76\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 2631 2963 \nQ 2534 3019 2420 3045 \nQ 2306 3072 2169 3072 \nQ 1681 3072 1420 2755 \nQ 1159 2438 1159 1844 \nL 1159 0 \nL 581 0 \nL 581 3500 \nL 1159 3500 \nL 1159 2956 \nQ 1341 3275 1631 3429 \nQ 1922 3584 2338 3584 \nQ 2397 3584 2469 3576 \nQ 2541 3569 2628 3553 \nL 2631 2963 \nz\n\" id=\"DejaVuSans-72\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 2194 1759 \nQ 1497 1759 1228 1600 \nQ 959 1441 959 1056 \nQ 959 750 1161 570 \nQ 1363 391 1709 391 \nQ 2188 391 2477 730 \nQ 2766 1069 2766 1631 \nL 2766 1759 \nL 2194 1759 \nz\nM 3341 1997 \nL 3341 0 \nL 2766 0 \nL 2766 531 \nQ 2569 213 2275 61 \nQ 1981 -91 1556 -91 \nQ 1019 -91 701 211 \nQ 384 513 384 1019 \nQ 384 1609 779 1909 \nQ 1175 2209 1959 2209 \nL 2766 2209 \nL 2766 2266 \nQ 2766 2663 2505 2880 \nQ 2244 3097 1772 3097 \nQ 1472 3097 1187 3025 \nQ 903 2953 641 2809 \nL 641 3341 \nQ 956 3463 1253 3523 \nQ 1550 3584 1831 3584 \nQ 2591 3584 2966 3190 \nQ 3341 2797 3341 1997 \nz\n\" id=\"DejaVuSans-61\" transform=\"scale(0.015625)\"/>\n       <path d=\"M 2906 1791 \nQ 2906 2416 2648 2759 \nQ 2391 3103 1925 3103 \nQ 1463 3103 1205 2759 \nQ 947 2416 947 1791 \nQ 947 1169 1205 825 \nQ 1463 481 1925 481 \nQ 2391 481 2648 825 \nQ 2906 1169 2906 1791 \nz\nM 3481 434 \nQ 3481 -459 3084 -895 \nQ 2688 -1331 1869 -1331 \nQ 1566 -1331 1297 -1286 \nQ 1028 -1241 775 -1147 \nL 775 -588 \nQ 1028 -725 1275 -790 \nQ 1522 -856 1778 -856 \nQ 2344 -856 2625 -561 \nQ 2906 -266 2906 331 \nL 2906 616 \nQ 2728 306 2450 153 \nQ 2172 0 1784 0 \nQ 1141 0 747 490 \nQ 353 981 353 1791 \nQ 353 2603 747 3093 \nQ 1141 3584 1784 3584 \nQ 2172 3584 2450 3431 \nQ 2728 3278 2906 2969 \nL 2906 3500 \nL 3481 3500 \nL 3481 434 \nz\n\" id=\"DejaVuSans-67\" transform=\"scale(0.015625)\"/>\n       <path id=\"DejaVuSans-20\" transform=\"scale(0.015625)\"/>\n      </defs>\n      <use xlink:href=\"#DejaVuSans-41\"/>\n      <use x=\"62.533203\" xlink:href=\"#DejaVuSans-76\"/>\n      <use x=\"121.712891\" xlink:href=\"#DejaVuSans-65\"/>\n      <use x=\"183.236328\" xlink:href=\"#DejaVuSans-72\"/>\n      <use x=\"224.349609\" xlink:href=\"#DejaVuSans-61\"/>\n      <use x=\"285.628906\" xlink:href=\"#DejaVuSans-67\"/>\n      <use x=\"349.105469\" xlink:href=\"#DejaVuSans-65\"/>\n      <use x=\"410.628906\" xlink:href=\"#DejaVuSans-20\"/>\n      <use x=\"442.416016\" xlink:href=\"#DejaVuSans-6c\"/>\n      <use x=\"470.199219\" xlink:href=\"#DejaVuSans-6f\"/>\n      <use x=\"531.380859\" xlink:href=\"#DejaVuSans-73\"/>\n      <use x=\"583.480469\" xlink:href=\"#DejaVuSans-73\"/>\n     </g>\n    </g>\n   </g>\n  </g>\n </g>\n <defs>\n  <clipPath id=\"p781276b0eb\">\n   <rect height=\"434.88\" width=\"446.4\" x=\"43.78125\" y=\"7.2\"/>\n  </clipPath>\n </defs>\n</svg>\n",
+      "image/png": "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\n"
+     },
+     "metadata": {}
+    },
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "Finished in 2:25:04\n"
+     ]
+    }
+   ],
+   "source": [
+    "num_epochs = 30\n",
+    "train_model(net, train_iter, criterion, optimizer, num_epochs=num_epochs)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "execute_result",
+     "data": {
+      "text/plain": [
+       "<All keys matched successfully>"
+      ]
+     },
+     "metadata": {},
+     "execution_count": 26
+    }
+   ],
+   "source": [
+    "net_trained = transformer(text_embedding_vectors = text_embedding_vectors, vocab_size=VOCAB_SIZE, num_layers=NUM_LAYERS, d_ff=D_FF, d_model=D_MODEL, num_heads=NUM_HEADS, dropout=DROPOUT).to(device)\n",
+    "net_trained.load_state_dict(torch.load('./snapshot/transformermodel.pt'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def stoi(vocab, token, max_len):\n",
+    "  indices=[]\n",
+    "  token.extend(['<pad>'] * (max_len - len(token)))\n",
+    "  for string in token:\n",
+    "    if string in vocab:\n",
+    "      i = vocab.index(string)\n",
+    "    else:\n",
+    "      i = 0\n",
+    "    indices.append(i)\n",
+    "  return torch.LongTensor(indices).unsqueeze(0)\n",
+    "\n",
+    "def itos(vocab, indices):\n",
+    "  text = []\n",
+    "  for i in indices.cpu()[0]:\n",
+    "    if i==1:\n",
+    "      break\n",
+    "    else:\n",
+    "      if i not in [PAD_TOKEN, START_TOKEN, END_TOKEN]:\n",
+    "          if i != UNK_TOKEN:\n",
+    "              text.append(vocab[i])\n",
+    "          else:\n",
+    "              text.append('??')\n",
+    "  return \" \".join(text)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def evaluate(input_sentence):\n",
+    "    VOCAB_SIZE = 40\n",
+    "    device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "    tokenizer = LTokenizer()\n",
+    "    token = tokenizer(input_sentence)\n",
+    "    input = stoi(Q.vocab.itos, token, VOCAB_SIZE).to(device)\n",
+    "    output = torch.LongTensor(1, 1).fill_(START_TOKEN).to(device)\n",
+    "    for i in range(VOCAB_SIZE):\n",
+    "        predictions = net_trained(input, output)\n",
+    "        predictions = predictions[:, -1:, :]\n",
+    "        predicted_id = torch.argmax(predictions[:,:,3:], axis=-1) + 3\n",
+    "        if predicted_id == END_TOKEN:\n",
+    "            predicted_id = predicted_id\n",
+    "            break\n",
+    "        output = torch.cat((output, predicted_id),-1)\n",
+    "    return output"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def predict(sentence):\n",
+    "  out = evaluate(sentence)\n",
+    "  out_text = itos(Q.vocab.itos, out)\n",
+    "  #print('input = [{0}]'.format(sentence))\n",
+    "  #print('output = [{0}]'.format(out_text))\n",
+    "  return out_text"
+   ]
+  },
+  {
+   "source": [
+    "# 테스트"
+   ],
+   "cell_type": "markdown",
+   "metadata": {}
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "execute_result",
+     "data": {
+      "text/plain": [
+       "'어떻게 하면 기분이 나아질 수 있을까요'"
+      ]
+     },
+     "metadata": {},
+     "execution_count": 36
+    }
+   ],
+   "source": [
+    "result  = predict('직장상사한테 혼났어 기분이 별로야')\n",
+    "result"
+   ]
+  }
+ ]
+}
